@@ -270,7 +270,8 @@ class InternalReplicaNode(Node):
             if type(msg) == TraversalReq:
                 # If the particle is sufficiently far away then send back a response.Otherwise, the
                 # node will forward the traversal request to every child (one replica each).
-                if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
+#                if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
+                if random.random() < Node.theta:
                     # this node is "sufficiently far away" and can respond
                     self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
                 else:
