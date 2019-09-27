@@ -71,7 +71,7 @@ class TraversalReq(Message):
         self.expected = expected
 
     def __str__(self):
-        return "(TraversalReq) " + super(Traversal, self).__str__()
+        return "(TraversalReq) " + super(TraversalReq, self).__str__()
 
 class TraversalResp(Message):
     def __init__(self, src, dst, iteration, sources, expected):
@@ -80,11 +80,11 @@ class TraversalResp(Message):
         self.expected = expected
 
     def __str__(self):
-        return "(TraversalResp) " + super(Traversal, self).__str__()
+        return "(TraversalResp) " + super(TraversalResp, self).__str__()
 
 class StartUpdate(Message):
     def __str__(self):
-        return "(StartUpdate) " + super(Update, self).__str__()
+        return "(StartUpdate) " + super(StartUpdate, self).__str__()
 
 class Update(Message):
     def __str__(self):
@@ -151,6 +151,9 @@ class Particle(Node):
         NBodySimulator.all_nodes += self.get_all_replicas()
         NBodySimulator.particle_nodes += self.get_all_replicas()
 
+    def __str__(self):
+        return self.name
+
     @staticmethod
     def init_params():
         pass
@@ -159,7 +162,7 @@ class Particle(Node):
         return [self]
 
     def log(self, s):
-        return self.logger.log('Particle Node {}: iteration_cnt: {} {}'.format(self.ID, self.iteration_cnt, s)
+        return self.logger.log('Particle Node {}: iteration_cnt: {} {}'.format(self.ID, self.iteration_cnt, s))
 
     def start(self):
         """Receive and process messages"""
@@ -171,7 +174,7 @@ class Particle(Node):
                 # send out initial traversal msg to a root node replica
                 dst_node = random.choice(NBodySimulator.root_node.get_all_replicas())
                 self.log('Sending traversal msg to root node {}'.format(dst_node.ID))
-                self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, sources=[] expected=[dst_node.master_ID]))
+                self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, sources=[], expected=[dst_node.master_ID]))
             elif type(msg) == TraversalReq:
                 # process request and send back response
                 yield self.env.timeout(Node.traversal_req_service_time.next())
@@ -205,7 +208,7 @@ class Particle(Node):
                     # send next traversal request
                     dst_node = random.choice(NBodySimulator.root_node.get_all_replicas())
                     self.log('Sending traversal msg to root node {}'.format(dst_node.ID))
-                    self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, sources=[] expected=[dst_node.master_ID]))
+                    self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, sources=[], expected=[dst_node.master_ID]))
 #            # TODO: currently unused
 #            elif type(msg) == Convergence:
 #                # quad tree has converged and it is safe to move onto the next iteration
@@ -240,7 +243,7 @@ class InternalReplicaNode(Node):
         pass
 
     def log(self, s):
-        return self.logger.log('Internal Replication Node {}: iteration_cnt: {} {}'.format(self.ID, self.iteration_cnt, s)
+        return self.logger.log('Internal Replication Node {}: iteration_cnt: {} {}'.format(self.ID, self.iteration_cnt, s))
 
     def set_children(self, children):
         self.children = children
@@ -294,6 +297,7 @@ class InternalMasterNode(Node):
         self.env.process(self.start())
         self.name = 'IM-{}'.format(self.ID)
         self.logger.set_filename('{}.log'.format(self.name))
+        self.master_ID = self.ID
 
         # make replicas
         self.replicas = [InternalReplicaNode(env, network, parents) for i in range(InternalMasterNode.rep_factor-1)]
@@ -321,12 +325,34 @@ class InternalMasterNode(Node):
         NBodySimulator.all_nodes += self.get_all_replicas()
         NBodySimulator.internal_nodes += self.get_all_replicas()
 
+    def str_help(self, pos):
+        if len(self.children[pos]) > 0:
+            return str([n for n in self.children[pos] if type(n) == InternalMasterNode or type(n) == Particle][0])
+        else:
+            return ''
+
+    def __str__(self):
+        node_str = str([n.name for n in self.get_all_replicas()])
+        nw_str = self.str_help('NW')
+        ne_str = self.str_help('NE')
+        sw_str = self.str_help('SW')
+        se_str = self.str_help('SE')
+        return """{}
+NW: {}
+NE: {}
+SW: {}
+SE: {}
+""".format(node_str, nw_str, ne_str, sw_str, se_str)
+
     def get_all_replicas(self):
         return [self] + self.replicas
 
     @staticmethod
     def init_params():
         InternalMasterNode.rep_factor = NBodySimulator.config['replication_factor'].next()
+
+    def log(self, s):
+        return self.logger.log('Internal Master Node {}: iteration_cnt: {} {}'.format(self.ID, self.iteration_cnt, s))
 
     def start(self):
         """Receive and process messages"""
@@ -338,7 +364,7 @@ class InternalMasterNode(Node):
                 # There is some probability that this node will service the request (i.e. the particle is
                 # sufficiently far away). In this case the node will send back a response. Otherwise, the
                 # node will forward the traversal request to every child (one replica each).
-                if ranndom.random() < Node.traversal_probability:
+                if random.random() < Node.traversal_prob:
                     # this node is "sufficiently far away" and can respond
                     self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
                 else:
@@ -401,7 +427,7 @@ class Network(object):
         Network.delay = NBodySimulator.config['network_delay'].next()
 
     def add_nodes(self, nodes):
-        self.nodes = {n.ID for n in nodes}
+        self.nodes = {n.ID: n for n in nodes}
 
     def start(self):
         """Start forwarding messages"""
@@ -493,15 +519,15 @@ class QuadTree:
             if data_q2.shape[0] > 0:
                 self.children['NW'] = QuadTree(data_q2,
                                                [xmin, ymid], [xmid, ymax],
-                                               self))
+                                               self)
             if data_q3.shape[0] > 0:
                 self.children['SE'] = QuadTree(data_q3,
                                                [xmid, ymin], [xmax, ymid],
-                                               self))
+                                               self)
             if data_q4.shape[0] > 0:
                 self.children['NE'] = QuadTree(data_q4,
                                                [xmid, ymid], [xmax, ymax],
-                                               self))
+                                               self)
 
     def num_particles(self):
         return self.data.shape[0]
@@ -562,6 +588,8 @@ class NBodySimulator(object):
         maxs = (1.1, 1.1)
         quadtree = QuadTree(X, mins, maxs)
         NBodySimulator.root_node = InternalMasterNode(self.env, self.network, quadtree, parents=[])
+        print "Quad Tree:"
+        print str(NBodySimulator.root_node)
 
     def init_sim(self):
         # initialize run local variables
@@ -598,16 +626,16 @@ class NBodySimulator(object):
         """This is called by each particle after it has received all of its required responses in the
            traversal phase of each iteration
         """
-         NBodySimulator.traversed_node_cnt += 1
-         if NBodySimulator.traversed_node_cnt == len(NBodySimulator.particle_nodes):
-             # all particles have completed traversal
-             NBodySimulator.traversal_times['all'].append(now - NBodySimulator.traversal_start_time)
-             NBodySimulator.traversal_start_time = now
-             NBodySimulator.traversed_node_cnt = 0
-             # TODO: this is temporary. The StartUpdate msgs will be triggered using a timer
-             # send out StartUpdate messages to all particle nodes
-             for n in NBodySimulator.particle_nodes:
-                 n.queue.put(StartUpdate(0, n.ID, NBodySimulator.iteration_cnt))
+        NBodySimulator.traversed_node_cnt += 1
+        if NBodySimulator.traversed_node_cnt == len(NBodySimulator.particle_nodes):
+            # all particles have completed traversal
+            NBodySimulator.traversal_times['all'].append(now - NBodySimulator.traversal_start_time)
+            NBodySimulator.traversal_start_time = now
+            NBodySimulator.traversed_node_cnt = 0
+            # TODO: this is temporary. The StartUpdate msgs will be triggered using a timer
+            # send out StartUpdate messages to all particle nodes
+            for n in NBodySimulator.particle_nodes:
+                n.queue.put(StartUpdate(0, n.ID, NBodySimulator.iteration_cnt))
 
     @staticmethod
     def check_done(now):
