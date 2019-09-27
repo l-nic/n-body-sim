@@ -113,7 +113,7 @@ class Node(object):
         self.env = env
         self.logger = Logger(env)
         self.network = network
-        self.queue = simpy.FilterStore(self.env)
+        self.queue = simpy.Store(self.env)
         self.ID = Node.count
         Node.count += 1
         self.iteration_cnt = 0 # local iteration counter
@@ -168,7 +168,7 @@ class Particle(Node):
         """Receive and process messages"""
         while not NBodySimulator.complete:
             # wait for a msg that is for the current iteration
-            msg = yield self.queue.get(filter = lambda msg: msg.iteration == self.iteration_cnt)
+            msg = yield self.queue.get()
             self.log('Processing message: {}'.format(str(msg)))
             if type(msg) == Start:
                 # send out initial traversal msg to a root node replica
@@ -228,7 +228,7 @@ class Particle(Node):
 class InternalReplicaNode(Node):
     """Internal Replica Node class."""
     count = 0
-    def __init__(self, env, network, parents):
+    def __init__(self, env, network, parents, master_ID=None):
         super(InternalReplicaNode, self).__init__(env, network)
         self.internal_node_ID = InternalReplicaNode.count
         InternalReplicaNode.count += 1
@@ -237,6 +237,11 @@ class InternalReplicaNode(Node):
         self.logger.set_filename('{}.log'.format(self.name))
 
         self.parents = parents
+
+        if master_ID is None:
+            self.master_ID = self.ID
+        else:
+            self.master_ID = master_ID
 
     @staticmethod
     def init_params():
@@ -252,7 +257,7 @@ class InternalReplicaNode(Node):
         """Receive and process messages"""
         while not NBodySimulator.complete:
             # wait for a msg that is for the current iteration
-            msg = yield self.queue.get(filter = lambda msg: msg.iteration == self.iteration_cnt)
+            msg = yield self.queue.get()
             self.log('Processing message: {}'.format(str(msg)))
             if type(msg) == TraversalReq:
                 # There is some probability that this node will service the request (i.e. the particle is
@@ -287,20 +292,19 @@ class InternalReplicaNode(Node):
                self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
                sys.exit(1)
 
-class InternalMasterNode(Node):
+class InternalMasterNode(InternalReplicaNode):
     """Internal Master Node class."""
     count = 0
     def __init__(self, env, network, quadtree, parents):
-        super(InternalMasterNode, self).__init__(env, network)
+        super(InternalMasterNode, self).__init__(env, network, parents)
         self.internal_node_ID = InternalMasterNode.count
         InternalMasterNode.count += 1
-        self.env.process(self.start())
+#        self.env.process(self.start())
         self.name = 'IM-{}'.format(self.ID)
         self.logger.set_filename('{}.log'.format(self.name))
-        self.master_ID = self.ID
 
         # make replicas
-        self.replicas = [InternalReplicaNode(env, network, parents) for i in range(InternalMasterNode.rep_factor-1)]
+        self.replicas = [InternalReplicaNode(env, network, parents, master_ID=self.ID) for i in range(InternalMasterNode.rep_factor-1)]
 
         # make sure that this is actually an internal node
         assert len(quadtree.children) > 0
@@ -338,10 +342,10 @@ class InternalMasterNode(Node):
         sw_str = self.str_help('SW')
         se_str = self.str_help('SE')
         return """{}
-NW: {}
-NE: {}
-SW: {}
-SE: {}
+NW: ({})
+NE: ({})
+SW: ({})
+SE: ({})
 """.format(node_str, nw_str, ne_str, sw_str, se_str)
 
     def get_all_replicas(self):
@@ -352,60 +356,60 @@ SE: {}
         InternalMasterNode.rep_factor = NBodySimulator.config['replication_factor'].next()
 
     def log(self, s):
-        return self.logger.log('Internal Master Node {}: iteration_cnt: {} {}'.format(self.ID, self.iteration_cnt, s))
+        return self.logger.log('{}: iteration_cnt: {} {}'.format(self.name, self.iteration_cnt, s))
 
-    def start(self):
-        """Receive and process messages"""
-        while not NBodySimulator.complete:
-            # wait for a msg that is for the current iteration
-            msg = yield self.queue.get(filter = lambda msg: msg.iteration == self.iteration_cnt)
-            self.log('Processing message: {}'.format(str(msg)))
-            if type(msg) == TraversalReq:
-                # There is some probability that this node will service the request (i.e. the particle is
-                # sufficiently far away). In this case the node will send back a response. Otherwise, the
-                # node will forward the traversal request to every child (one replica each).
-                if random.random() < Node.traversal_prob:
-                    # this node is "sufficiently far away" and can respond
-                    self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
-                else:
-                    # need to forward traversal request to one replica of each child
-                    # select targets
-                    targets = []
-                    for c, replicas in self.children.iteritems():
-                        targets.append(random.choice(replicas))
-                    master_targets = [t.master_ID for t in targets]
-                    # forward request to each target
-                    for t in targets:
-                        fwd_msg = TraversalReq(self.ID, t.ID, msg.iteration, msg.traversal_src,
-                                               sources = [self.master_ID] + msg.sources,
-                                               expected = msg.expected + master_targets)
-                        self.network.queue.put(fwd_msg)
-#            # TODO: implement tree update logic ...
-#            elif type(msg) == Update:
-#                # The update msg either came from a parent (new particle has entered the bounding box)
-#                # or came from a child (is this particle still in the bounding box?)
-#                if msg.src in self.parents:
-#                    # classify the particle into one of the children
-#                    child_name = random.choice(self.children.keys())
-#                    if child_name.startswith('P'):
-#                        child_node = self.children[child_name][0]
-#                        # the selected child is a particle node so need to spawn a new InternalMasterNode
-#                        del self.children[child_name]
-#                        new_node = InternalMasterNode(self.env, Logger(self.env), self.network, QuadTree(children=[msg.particle_node, child_node]), parents=self.get_all_replicas())
-#                        self.children[new_node.name] = new_node.get_all_replicas()
-#                        # TODO: need to add this new node to the global list of nodes and start sampling its queue size
-#                        # TODO: send out ReplicaUpdate msg to inform them of the new child
-#                else:
-#                    # assume the msg came from a child node
-#            elif type(msg) == RemovalReq:
-#                pass 
-#            elif type(msg) == RemovalResp:
-#                pass
-#            elif type(msg) == Convergence:
-#                pass
-            else:
-               self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
-               sys.exit(1)
+#     def start(self):
+#         """Receive and process messages"""
+#         while not NBodySimulator.complete:
+#             # wait for a msg that is for the current iteration
+#             msg = yield self.queue.get()
+#             self.log('Processing message: {}'.format(str(msg)))
+#             if type(msg) == TraversalReq:
+#                 # There is some probability that this node will service the request (i.e. the particle is
+#                 # sufficiently far away). In this case the node will send back a response. Otherwise, the
+#                 # node will forward the traversal request to every child (one replica each).
+#                 if random.random() < Node.traversal_prob:
+#                     # this node is "sufficiently far away" and can respond
+#                     self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
+#                 else:
+#                     # need to forward traversal request to one replica of each child
+#                     # select targets
+#                     targets = []
+#                     for c, replicas in self.children.iteritems():
+#                         targets.append(random.choice(replicas))
+#                     master_targets = [t.master_ID for t in targets]
+#                     # forward request to each target
+#                     for t in targets:
+#                         fwd_msg = TraversalReq(self.ID, t.ID, msg.iteration, msg.traversal_src,
+#                                                sources = [self.master_ID] + msg.sources,
+#                                                expected = msg.expected + master_targets)
+#                         self.network.queue.put(fwd_msg)
+# #            # TODO: implement tree update logic ...
+# #            elif type(msg) == Update:
+# #                # The update msg either came from a parent (new particle has entered the bounding box)
+# #                # or came from a child (is this particle still in the bounding box?)
+# #                if msg.src in self.parents:
+# #                    # classify the particle into one of the children
+# #                    child_name = random.choice(self.children.keys())
+# #                    if child_name.startswith('P'):
+# #                        child_node = self.children[child_name][0]
+# #                        # the selected child is a particle node so need to spawn a new InternalMasterNode
+# #                        del self.children[child_name]
+# #                        new_node = InternalMasterNode(self.env, Logger(self.env), self.network, QuadTree(children=[msg.particle_node, child_node]), parents=self.get_all_replicas())
+# #                        self.children[new_node.name] = new_node.get_all_replicas()
+# #                        # TODO: need to add this new node to the global list of nodes and start sampling its queue size
+# #                        # TODO: send out ReplicaUpdate msg to inform them of the new child
+# #                else:
+# #                    # assume the msg came from a child node
+# #            elif type(msg) == RemovalReq:
+# #                pass 
+# #            elif type(msg) == RemovalResp:
+# #                pass
+# #            elif type(msg) == Convergence:
+# #                pass
+#             else:
+#                self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
+#                sys.exit(1)
 
 
 #############
