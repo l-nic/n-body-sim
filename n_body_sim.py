@@ -27,7 +27,8 @@ class Logger(object):
 
     def set_filename(self, filename):
         self.filename = os.path.join(NBodySimulator.out_run_dir, filename)
-        clear_file(self.filename)
+        if Logger.debug:
+            clear_file(self.filename)
 
     def log(self, s):
         if Logger.debug:
@@ -546,8 +547,8 @@ class NBodySimulator(object):
         maxs = (1.1, 1.1)
         quadtree = QuadTree(X, mins, maxs)
         NBodySimulator.root_node = InternalMasterNode(self.env, self.network, quadtree, parents=[])
-        print "Quad Tree:"
-        print str(NBodySimulator.root_node)
+        self.logger.log("Quad Tree:")
+        self.logger.log(str(NBodySimulator.root_node))
 
     def init_sim(self):
         # initialize run local variables
