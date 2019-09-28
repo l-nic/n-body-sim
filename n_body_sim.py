@@ -137,7 +137,7 @@ class Node(object):
 class Particle(Node):
     """Particle Node class."""
     count = 0
-    def __init__(self, env, network, parents, pos):
+    def __init__(self, env, network, parents, parent_master_ID, pos):
         super(Particle, self).__init__(env, network)
         self.particle_ID = Particle.count
         Particle.count += 1
@@ -149,6 +149,7 @@ class Particle(Node):
         self.pos = pos
 
         self.parents = parents
+        self.parent_master_ID = parent_master_ID
         self.master_ID = self.ID
         self.response_bitmap = {}
 
@@ -205,6 +206,9 @@ class Particle(Node):
                 if len(self.response_bitmap) != sum(self.response_bitmap.values()):
                     self.log('ERROR: All required responses have not been received ... Iteration failed')
                     sys.exit(1)
+                # send Update msg to master parent
+                
+
                 # TODO: This is just place holder logic to move onto the next iteration immediately because the update phase is not implemented
                 self.iteration_cnt += 1
                 self.response_bitmap = {}
@@ -233,7 +237,7 @@ class Particle(Node):
 class InternalReplicaNode(Node):
     """Internal Replica Node class."""
     count = 0
-    def __init__(self, env, network, parents, com, sizes, master_ID=None):
+    def __init__(self, env, network, parents, parent_master_ID, com, sizes, master_ID=None):
         super(InternalReplicaNode, self).__init__(env, network)
         self.internal_node_ID = InternalReplicaNode.count
         InternalReplicaNode.count += 1
@@ -242,6 +246,7 @@ class InternalReplicaNode(Node):
         self.logger.set_filename('{}.log'.format(self.name))
 
         self.parents = parents
+        self.parent_master_ID = parent_master_ID
         # Center of Mass (X,Y) position
         self.com = com
         # Size of bounding box (X width, Y width)
@@ -257,10 +262,33 @@ class InternalReplicaNode(Node):
         pass
 
     def log(self, s):
-        return self.logger.log('{}: iteration_cnt: {} {}'.format(self.name, self.iteration_cnt, s))
+        return self.logger.log('{}: {}'.format(self.name, s))
 
     def set_children(self, children):
         self.children = children
+
+    def process_traversal_req(self, msg):
+        yield self.env.timeout(Node.traversal_req_service_time.next())
+        # If the particle is sufficiently far away then send back a response.Otherwise, the
+        # node will forward the traversal request to every child (one replica each).
+#        if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
+        if random.random() < Node.theta:
+            # this node is "sufficiently far away" and can respond
+            self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
+        else:
+            # need to forward traversal request to one replica of each child
+            # select targets
+            targets = []
+            for c, replicas in self.children.iteritems():
+                if len(replicas) > 0:
+                    targets.append(random.choice(replicas))
+            master_targets = [t.master_ID for t in targets]
+            # forward request to each target
+            for t in targets:
+                fwd_msg = TraversalReq(self.ID, t.ID, msg.iteration, msg.traversal_src, msg.pos,
+                                       sources = [self.master_ID] + msg.sources,
+                                       expected = msg.expected + master_targets)
+                self.network.queue.put(fwd_msg)
 
     def start(self):
         """Receive and process messages"""
@@ -269,26 +297,91 @@ class InternalReplicaNode(Node):
             msg = yield self.queue.get()
             self.log('Processing message: {}'.format(str(msg)))
             if type(msg) == TraversalReq:
-                # If the particle is sufficiently far away then send back a response.Otherwise, the
-                # node will forward the traversal request to every child (one replica each).
-#                if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
-                if random.random() < Node.theta:
-                    # this node is "sufficiently far away" and can respond
-                    self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
-                else:
-                    # need to forward traversal request to one replica of each child
-                    # select targets
-                    targets = []
-                    for c, replicas in self.children.iteritems():
-                        if len(replicas) > 0:
-                            targets.append(random.choice(replicas))
-                    master_targets = [t.master_ID for t in targets]
-                    # forward request to each target
-                    for t in targets:
-                        fwd_msg = TraversalReq(self.ID, t.ID, msg.iteration, msg.traversal_src, msg.pos,
-                                               sources = [self.master_ID] + msg.sources,
-                                               expected = msg.expected + master_targets)
-                        self.network.queue.put(fwd_msg)
+                yield self.env.process(self.process_traversal_req(msg))
+            else:
+               self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
+               sys.exit(1)
+
+class InternalMasterNode(InternalReplicaNode):
+    """Internal Master Node class."""
+    count = 0
+    def __init__(self, env, network, com, sizes, parents, parent_master_ID=None):
+        super(InternalMasterNode, self).__init__(env, network, parents, parent_master_ID, com, sizes)
+        self.internal_node_ID = InternalMasterNode.count
+        InternalMasterNode.count += 1
+        self.name = 'IM-{}'.format(self.ID)
+        self.logger.set_filename('{}.log'.format(self.name))
+
+        # make replicas
+        self.replicas = [InternalReplicaNode(env, network, parents, parent_master_ID, self.com, self.sizes, master_ID=self.ID) for i in range(InternalMasterNode.rep_factor-1)]
+
+        # add self and replicas to simulation nodes
+        NBodySimulator.all_nodes += self.get_all_replicas()
+        NBodySimulator.internal_nodes += self.get_all_replicas()
+
+    def set_children(self, children):
+        """Directly set children rather than initializing using a quadtree"""
+        self.children = children
+        # assign children to all replicas
+        for r in self.replicas:
+            r.set_children(self.children)
+
+    def init_with_quadtree(self, quadtree):
+        """Initialize the children using a quadtree"""
+        # make sure that this is actually an internal node
+        assert len(quadtree.children) > 0
+
+        # create the children nodes
+        # self.children is a dictionary that maps position to list of replicas
+        self.children = {'NW':[], 'NE':[], 'SW':[], 'SE':[]}
+        for pos, qt_child in quadtree.children.iteritems():
+            if qt_child.num_particles() == 1:
+                # create particle node
+                node = Particle(self.env, self.network, parents=self.get_all_replicas(), parent_master_ID=self.ID, pos=qt_child.data[0])
+            else:
+                # create new internal master node (recursive call)
+                node = InternalMasterNode(self.env, self.network, qt_child.mids, qt_child.sizes, parents=self.get_all_replicas(), parent_master_ID=self.ID)
+                node.init_with_quadtree(qt_child)
+            self.children[pos] = node.get_all_replicas()
+
+        # assign children to all replicas
+        for r in self.replicas:
+            r.set_children(self.children)
+
+    def get_all_replicas(self):
+        return [self] + self.replicas
+
+    def str_child(self, pos):
+        if len(self.children[pos]) > 0:
+            return str([n for n in self.children[pos] if type(n) == InternalMasterNode or type(n) == Particle][0])
+        else:
+            return ''
+
+    def __str__(self):
+        node_str = str([n.name for n in self.get_all_replicas()])
+        nw_str = self.str_child('NW')
+        ne_str = self.str_child('NE')
+        sw_str = self.str_child('SW')
+        se_str = self.str_child('SE')
+        return """{}
+NW: ({})
+NE: ({})
+SW: ({})
+SE: ({})
+""".format(node_str, nw_str, ne_str, sw_str, se_str)
+
+    @staticmethod
+    def init_params():
+        InternalMasterNode.rep_factor = NBodySimulator.config['replication_factor'].next()
+
+    def start(self):
+        """Receive and process messages"""
+        while not NBodySimulator.complete:
+            # wait for a msg that is for the current iteration
+            msg = yield self.queue.get()
+            self.log('Processing message: {}'.format(str(msg)))
+            if type(msg) == TraversalReq:
+                yield self.env.process(self.process_traversal_req(msg))
 #            # TODO: implement the tree update phase
 #            elif type(msg) == Update:
 #                pass
@@ -301,71 +394,6 @@ class InternalReplicaNode(Node):
             else:
                self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
                sys.exit(1)
-
-class InternalMasterNode(InternalReplicaNode):
-    """Internal Master Node class."""
-    count = 0
-    def __init__(self, env, network, quadtree, parents):
-        super(InternalMasterNode, self).__init__(env, network, parents, com=quadtree.mids, sizes=quadtree.sizes)
-        self.internal_node_ID = InternalMasterNode.count
-        InternalMasterNode.count += 1
-        self.name = 'IM-{}'.format(self.ID)
-        self.logger.set_filename('{}.log'.format(self.name))
-
-        # make replicas
-        self.replicas = [InternalReplicaNode(env, network, parents, self.com, self.sizes, master_ID=self.ID) for i in range(InternalMasterNode.rep_factor-1)]
-
-        # make sure that this is actually an internal node
-        assert len(quadtree.children) > 0
-
-        # create the children nodes
-        # self.children is a dictionary that maps position to list of replicas
-        self.children = {'NW':[], 'NE':[], 'SW':[], 'SE':[]}
-        for pos, qt_child in quadtree.children.iteritems():
-            if qt_child.num_particles() == 1:
-                # create particle node
-                node = Particle(env, network, parents=self.get_all_replicas(), pos=qt_child.data[0])
-            else:
-                # create new internal master node (recursive call)
-                node = InternalMasterNode(env, network, qt_child, parents=self.get_all_replicas())
-            self.children[pos] = node.get_all_replicas()
-
-        # assign children to all replicas
-        for r in self.replicas:
-            r.set_children(self.children)
-
-        # add self and replicas to simulation nodes
-        NBodySimulator.all_nodes += self.get_all_replicas()
-        NBodySimulator.internal_nodes += self.get_all_replicas()
-
-    def str_help(self, pos):
-        if len(self.children[pos]) > 0:
-            return str([n for n in self.children[pos] if type(n) == InternalMasterNode or type(n) == Particle][0])
-        else:
-            return ''
-
-    def __str__(self):
-        node_str = str([n.name for n in self.get_all_replicas()])
-        nw_str = self.str_help('NW')
-        ne_str = self.str_help('NE')
-        sw_str = self.str_help('SW')
-        se_str = self.str_help('SE')
-        return """{}
-NW: ({})
-NE: ({})
-SW: ({})
-SE: ({})
-""".format(node_str, nw_str, ne_str, sw_str, se_str)
-
-    def get_all_replicas(self):
-        return [self] + self.replicas
-
-    @staticmethod
-    def init_params():
-        InternalMasterNode.rep_factor = NBodySimulator.config['replication_factor'].next()
-
-    def log(self, s):
-        return self.logger.log('{}: iteration_cnt: {} {}'.format(self.name, self.iteration_cnt, s))
 
 #############
 ## Network ##
@@ -546,7 +574,8 @@ class NBodySimulator(object):
         mins = (-0.1, -0.1)
         maxs = (1.1, 1.1)
         quadtree = QuadTree(X, mins, maxs)
-        NBodySimulator.root_node = InternalMasterNode(self.env, self.network, quadtree, parents=[])
+        NBodySimulator.root_node = InternalMasterNode(self.env, self.network, quadtree.mids, quadtree.sizes, parents=[])
+        NBodySimulator.root_node.init_with_quadtree(quadtree)
         self.logger.log("Quad Tree:")
         self.logger.log(str(NBodySimulator.root_node))
 
