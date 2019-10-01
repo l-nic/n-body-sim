@@ -466,6 +466,8 @@ class InternalMasterNode(InternalReplicaNode):
                 # assign children's new parents
                 for c in c_replicas:
                     c.set_parents(self.parents, send_update=True)
+                # unset the parent's convergence bit for the new child
+                parent_master.convergence_bits[parent_box_ID] = 0
                 # tell parent that it needs to process an update from this new particle before it can converge
                 parent_master.update_bits[c_replicas[0].master_ID] = 0
 
@@ -478,9 +480,6 @@ class InternalMasterNode(InternalReplicaNode):
             if type(msg) == TraversalReq:
                 yield self.env.process(self.process_traversal_req(msg))
             elif type(msg) == Update:
-                # check if this is one of the particles we need to process before converging
-                if msg.update_src in self.update_bits:
-                    self.update_bits[msg.update_src] = 1
                 # check if the particle is in this bounding box
                 result = self.classify_pos(msg.pos)
                 self.log('Classified particle {} into box {}'.format(msg.pos, result))
@@ -504,6 +503,10 @@ class InternalMasterNode(InternalReplicaNode):
                     # the particle is in this bounding box
                     particle_node = NBodySimulator.nodes[msg.update_src]
                     self.add_particle(particle_node, msg.iteration)
+                # check if this is one of the particles we need to process before converging
+                if not self.killed and msg.update_src in self.update_bits:
+                    self.update_bits[msg.update_src] = 1
+                    self.check_convergence(msg.iteration)
             elif type(msg) == Convergence:
                 # Can receive convergence msg from child or parent
                 # If from parent then forward to all children and reset convergence tracking state
@@ -573,6 +576,7 @@ class InternalMasterNode(InternalReplicaNode):
         self.log('Checking convergence: {}/{} children converged'.format(sum(self.convergence_bits.values()), self.num_children()))
         self.log('children = {}, convergence_bits = {}'.format({b:str(map(str, c)) for b,c in self.children.iteritems()}, self.convergence_bits))
         self.log('Checking updates: {}/{} particles processed'.format(sum(self.update_bits.values()), len(self.update_bits)))
+        self.log('update_bits = {}'.format(self.update_bits))
         if self.num_children() == sum(self.convergence_bits.values()) and len(self.update_bits) == sum(self.update_bits.values()):
             # all required convergence/update msgs have been received
             # send convergence msgs either up or down
@@ -585,7 +589,7 @@ class InternalMasterNode(InternalReplicaNode):
             else:
                # this is a non-root node
                # send convergence msg to parent
-               self.log('')
+               self.log('Sending Convergence msg to parent')
                self.network.queue.put(Convergence(self.ID, self.parents[0].master_ID, iteration))
 
     def fwd_convergence_children(self, iteration):
