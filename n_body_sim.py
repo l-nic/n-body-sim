@@ -62,9 +62,9 @@ class Message(object):
     def __str__(self):
         return "Message {}: src={}, dst={}, iteration={}".format(self.ID, self.src, self.dst, self.iteration)
 
-class Start(Message):
+class StartTraversal(Message):
     def __str__(self):
-        return "(Start) " + super(Start, self).__str__()
+        return "(StartTraversal) " + super(StartTraversal, self).__str__()
 
 class TraversalReq(Message):
     def __init__(self, src, dst, iteration, traversal_src, pos, sources, expected):
@@ -158,6 +158,9 @@ class Particle(Node):
         # (X,Y) position of particle
         self.pos = pos
 
+        # Send StartUpdate msg to neighbor after we finish updating the tree
+        self.neighbor = None # default
+
         self.parents = parents
         self.master_ID = self.ID
         self.response_bitmap = {}
@@ -177,13 +180,11 @@ class Particle(Node):
     def init_params():
         pass
 
-    def set_parents(self, parents, send_update=False):
-        self.parents = parents
+    def set_neighbor(self, neighbor):
+        self.neighbor = neighbor
 
-        # need to potenitally resend update in this iteration
-        # this is needed if a particle originally sent an update to a parent node that was killed
-        if send_update:
-            self.network.queue.put(Update(self.ID, self.parents[0].master_ID, self.iteration_cnt, self.ID, self.pos))
+    def set_parents(self, parents):
+        self.parents = parents
 
     def get_all_replicas(self):
         return [self]
@@ -197,7 +198,7 @@ class Particle(Node):
             # wait for a msg that is for the current iteration
             msg = yield self.queue.get()
             self.log('Processing message: {}'.format(str(msg)))
-            if type(msg) == Start:
+            if type(msg) == StartTraversal:
                 # send out initial traversal msg to a root node replica
                 self.start_traversal()
             elif type(msg) == TraversalReq:
@@ -220,10 +221,11 @@ class Particle(Node):
                     # all required responses have been received for this particle
                     NBodySimulator.check_traversal_done(self.env.now)
             elif type(msg) == StartUpdate:
-                # check to make sure all responses have been received
+                # check to make sure all traversal responses have been received
                 if len(self.response_bitmap) != sum(self.response_bitmap.values()):
                     self.log('ERROR: All required responses have not been received ... Iteration failed')
                     sys.exit(1)
+                # reset traversal response tracking state
                 self.response_bitmap = {}
                 # update the particle's position randomly
                 self.pos += (np.random.random((1, 2))[0] + np.array([-0.5, -0.5]))*Node.velocity
@@ -232,12 +234,18 @@ class Particle(Node):
                 # send Update msg to master parent
                 self.network.queue.put(Update(self.ID, self.parents[0].master_ID, self.iteration_cnt, self.ID, self.pos))
             elif type(msg) == Convergence:
-                # quad tree has converged and it is safe to move onto the next iteration
+                # quad tree has converged after our update and its safe to move onto the next (if any) update
                 self.iteration_cnt += 1
                 # check if the simulation has completed
                 NBodySimulator.check_done(self.env.now)
-                if not NBodySimulator.complete:
-                    self.start_traversal()
+                if self.neighbor is not None:
+                    # Our update is complete so it's safe for our neighbor to perform their update
+                    self.network.queue.put(StartUpdate(self.ID, self.neighbor.ID, self.iteration_cnt-1))
+                else:
+                    # this is the last particle that needs to perform an update -- send out StartTraversal msgs if the simulation is not complete
+                    if not NBodySimulator.complete:
+                        for n in NBodySimulator.particle_nodes.values():
+                            self.network.queue.put(StartTraversal(self.ID, n.ID, self.iteration_cnt))
             else:
                self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
                sys.exit(1)
@@ -327,15 +335,6 @@ class InternalMasterNode(InternalReplicaNode):
         self.name = 'IM-{}'.format(self.ID)
         self.logger.set_filename('{}.log'.format(self.name))
 
-        # this iteration attribute is only used by the master root node to ensure only
-        # one convergence msg is forwarded to all children
-        self.iteration = 0
-
-        # bits to keep track of which children have converged in each iteration
-        self.convergence_bits = {}
-        # bits to keep track of which children particle nodes we've processed updates from in each iteration
-        self.update_bits = {}
-
         # make replicas
         self.replicas = [InternalReplicaNode(env, network, mins, maxs, parents, master_ID=self.ID) for i in range(InternalMasterNode.rep_factor-1)]
 
@@ -413,8 +412,6 @@ class InternalMasterNode(InternalReplicaNode):
             assert len(particles) == 1, "Incorrect number of particles in box ..."
             self.children[box] = particles[0].get_all_replicas()
             particles[0].set_parents(self.get_all_replicas())
-            # remember to process update from this particle
-            self.update_bits[particles[0].master_ID] = 0
         else:
             self.children[box] = []
 
@@ -465,11 +462,7 @@ class InternalMasterNode(InternalReplicaNode):
                     p.children[parent_box_ID] = c_replicas
                 # assign children's new parents
                 for c in c_replicas:
-                    c.set_parents(self.parents, send_update=True)
-                # unset the parent's convergence bit for the new child
-                parent_master.convergence_bits[parent_box_ID] = 0
-                # tell parent that it needs to process an update from this new particle before it can converge
-                parent_master.update_bits[c_replicas[0].master_ID] = 0
+                    c.set_parents(self.parents)
 
     def start(self):
         """Receive and process messages"""
@@ -502,26 +495,7 @@ class InternalMasterNode(InternalReplicaNode):
                 else:
                     # the particle is in this bounding box
                     particle_node = NBodySimulator.nodes[msg.update_src]
-                    self.add_particle(particle_node, msg.iteration)
-                # check if this is one of the particles we need to process before converging
-                if not self.killed and msg.update_src in self.update_bits:
-                    self.update_bits[msg.update_src] = 1
-                    self.check_convergence(msg.iteration)
-            elif type(msg) == Convergence:
-                # Can receive convergence msg from child or parent
-                # If from parent then forward to all children and reset convergence tracking state
-                # If from child then check to see if we've received convergence msgs from all internal nodes and update msgs from all particle nodes
-                #   If all msgs have been received then send convergence msg upstream (or downstream if root node)
-                if msg.src in [n.ID for n in self.parents]:
-                    # convergence msg from parent -- forward to all children
-                    self.log('Received Convergence msg from parent -- forwarding to all children')
-                    self.fwd_convergence_children(msg.iteration)
-                else:
-                    # convergence msg from child -- set convergence bit
-                    self.log('Received Convergence msg from child')
-                    child_box = self.lookup_child_ID(msg.src)
-                    self.convergence_bits[child_box] = 1
-                    self.check_convergence(msg.iteration)
+                    self.add_particle(particle_node, msg.iteration, msg.update_src)
             else:
                 self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
                 sys.exit(1)
@@ -529,82 +503,42 @@ class InternalMasterNode(InternalReplicaNode):
     def num_children(self):
         return sum([1 for nodes in self.children.values() if len(nodes) > 0])
 
-    def add_particle(self, particle_node, iteration):
+    def add_particle(self, particle_node, iteration, update_src):
         """Add the given particle node as a child"""
         child_box = self.classify_pos(particle_node.pos)
         assert child_box is not None, "Attempted to add a particle child that is not in this box"
 
-        self.log('Attempting to add particle {} to box {}'.format(particle_node.pos, child_box))
+        self.log('Attempting to add particle {} ({}) to box {}'.format(particle_node.name, particle_node.pos, child_box))
 
         # if the particle is already a child, remove it before preceeding
         orig_child_box = self.lookup_child_ID(particle_node.ID)
         if orig_child_box is not None:
             self.children[orig_child_box] = []
 
-        if len(self.children[child_box]) == 0 or (type(self.children[child_box][0]) == Particle and self.update_bits[self.children[child_box][0].master_ID] == 0):
-            # currently no children is this box OR there is a particle child, but its update hasn't been processed yet
+        if len(self.children[child_box]) == 0:
+            # currently no children is this box so add it here and send convergence msg
             self.log('Added particle {} to box {}'.format(particle_node.pos, child_box))
             self.children[child_box] = particle_node.get_all_replicas()
             particle_node.set_parents(self.get_all_replicas())
-            # set this child's convergence bit and check if this node has converged
-            self.convergence_bits[child_box] = 1
-            self.check_convergence(iteration)
+            # send convergence msg to the particle so the next particle can perform its update
+            if particle_node.ID == update_src:
+                # only send Convergence msg to the particle that initiated the update
+                self.network.queue.put(Convergence(self.ID, particle_node.ID, iteration))
         elif type(self.children[child_box][0]) in [InternalMasterNode, InternalReplicaNode]:
             # send update to the child internal node
             self.log('Sending update to child internal node')
             child_master_ID = self.children[child_box][0].master_ID
             self.network.queue.put(Update(self.ID, child_master_ID, iteration, particle_node.ID, particle_node.pos))
-            # unset this child's convergence bit until re-receiving a convergence message from it
-            self.convergence_bits[child_box] = 0
-        elif type(self.children[child_box][0]) == Particle and self.update_bits[self.children[child_box][0].master_ID] == 1:
+        elif type(self.children[child_box][0]) == Particle:
             # particle was classified into the same box as another particle
             self.log('Creating new internal node')
             # create new internal node
             new_node = InternalMasterNode(self.env, self.network, self.get_child_mins(child_box), self.get_child_maxs(child_box), parents=self.get_all_replicas())
             orig_particle_node = NBodySimulator.nodes[self.children[child_box][0].master_ID]
-            # recursively add particles to the new node
-            new_node.add_particle(orig_particle_node, iteration)
-            new_node.add_particle(particle_node, iteration)
+            # recursively add both particles to the new node
+            new_node.add_particle(orig_particle_node, iteration, update_src)
+            new_node.add_particle(particle_node, iteration, update_src)
             self.children[child_box] = new_node.get_all_replicas()
-            # unset this child's convergence bit until re-receiving a convergence message from it
-            self.convergence_bits[child_box] = 0
-
-    def check_convergence(self, iteration):
-        """Check if all required convergence / update msgs have arrived.
-           If so then send out Convergence msgs.
-        """
-        self.log('Checking convergence: {}/{} children converged'.format(sum(self.convergence_bits.values()), self.num_children()))
-        self.log('children = {}, convergence_bits = {}'.format({b:str(map(str, c)) for b,c in self.children.iteritems()}, self.convergence_bits))
-        self.log('Checking updates: {}/{} particles processed'.format(sum(self.update_bits.values()), len(self.update_bits)))
-        self.log('update_bits = {}'.format(self.update_bits))
-        if self.num_children() == sum(self.convergence_bits.values()) and len(self.update_bits) == sum(self.update_bits.values()):
-            # all required convergence/update msgs have been received
-            # send convergence msgs either up or down
-            if len(self.parents) == 0:
-                # this is the root node so send convergence msgs to all children
-                if self.iteration == iteration:
-                    # make sure to only do this once per iteration
-                    self.fwd_convergence_children(iteration)
-                    self.iteration += 1
-            else:
-               # this is a non-root node
-               # send convergence msg to parent
-               self.log('Sending Convergence msg to parent')
-               self.network.queue.put(Convergence(self.ID, self.parents[0].master_ID, iteration))
-
-    def fwd_convergence_children(self, iteration):
-        self.log('Forwarding convergence msgs to children')
-        # reset update_bits
-        self.update_bits = {}
-        # send convergence msgs to children
-        for children in self.children.values():
-            if len(children) > 0:
-                self.network.queue.put(Convergence(self.ID, children[0].master_ID, iteration))
-                # reset update bits
-                if type(children[0]) == Particle:
-                    self.update_bits[children[0].master_ID] = 0
-        # reset convergence bits
-        self.convergence_bits = {}
 
     def classify_pos(self, pos):
         """Classify the position into the appropriate chlid bounding box or return none if it is not in this bounding box """
@@ -734,7 +668,6 @@ class NBodySimulator(object):
         NBodySimulator.traversed_node_cnt = 0
         NBodySimulator.converged_node_cnt = 0
         NBodySimulator.iteration_cnt = 0
-        NBodySimulator.traversal_start_time = 0
         NBodySimulator.iteration_start_time = 0
         NBodySimulator.finish_time = 0
 
@@ -746,7 +679,7 @@ class NBodySimulator(object):
 
         # send out Start messages to particle nodes
         for n in NBodySimulator.particle_nodes.values():
-            n.queue.put(Start(0, n.ID, 0))
+            self.network.queue.put(StartTraversal(0, n.ID, 0))
         # start logging
         if self.sample_period > 0:
             self.env.process(self.sample_queues())
@@ -764,6 +697,12 @@ class NBodySimulator(object):
         maxs = np.array([1.1, 1.1])
         # create all particles
         particles = [Particle(self.env, self.network, pos, []) for pos in X]
+        # assign neighbors to particles
+        for i in range(NBodySimulator.num_particles-1):
+            particles[i].set_neighbor(particles[i+1])
+
+        NBodySimulator.start_particle = particles[0]
+
         # create quadtree
         NBodySimulator.root_node = InternalMasterNode(self.env, self.network, mins, maxs, particles, parents=[])
         NBodySimulator.log_quadtree()
@@ -793,13 +732,10 @@ class NBodySimulator(object):
         if NBodySimulator.traversed_node_cnt == len(NBodySimulator.particle_nodes):
             # all particles have completed traversal
             NBodySimulator.iteration_log['iteration'].append(NBodySimulator.iteration_cnt)
-            NBodySimulator.iteration_log['traversal_time'].append(now - NBodySimulator.traversal_start_time)
-            NBodySimulator.traversal_start_time = now
+            NBodySimulator.iteration_log['traversal_time'].append(now - NBodySimulator.iteration_start_time)
             NBodySimulator.traversed_node_cnt = 0
-            # TODO: this is temporary. The StartUpdate msgs will be triggered using a timer
-            # send out StartUpdate messages to all particle nodes
-            for n in NBodySimulator.particle_nodes.values():
-                n.queue.put(StartUpdate(0, n.ID, NBodySimulator.iteration_cnt))
+            # send StartUpdate msg to the start particle
+            NBodySimulator.start_particle.queue.put(StartUpdate(0, NBodySimulator.start_particle.ID, NBodySimulator.iteration_cnt))
 
     @staticmethod
     def check_done(now):
