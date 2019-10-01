@@ -217,6 +217,7 @@ class Particle(Node):
                         self.response_bitmap[n] = 0
                 for n in msg.sources:
                     self.response_bitmap[n] = 1
+                self.log('Updated response_bitmap = {}'.format(self.response_bitmap))
                 if len(self.response_bitmap) == sum(self.response_bitmap.values()):
                     # all required responses have been received for this particle
                     NBodySimulator.check_traversal_done(self.env.now)
@@ -463,6 +464,12 @@ class InternalMasterNode(InternalReplicaNode):
                 # assign children's new parents
                 for c in c_replicas:
                     c.set_parents(self.parents)
+        # check if the parent should also be killed
+        parent_ID = parent_master.check_kill()
+
+        # return the ID of the parent of the last killed node
+        parent_ID = parent_ID if parent_ID is not None else self.parents[0].master_ID
+        return parent_ID
 
     def start(self):
         """Receive and process messages"""
@@ -475,23 +482,20 @@ class InternalMasterNode(InternalReplicaNode):
             elif type(msg) == Update:
                 # check if the particle is in this bounding box
                 result = self.classify_pos(msg.pos)
-                self.log('Classified particle {} into box {}'.format(msg.pos, result))
+                self.log('Classified particle P-{} ({}) into box {}'.format(msg.update_src, msg.pos, result))
                 if result is None:
                     # the particle is not in this bounding box
                     assert len(self.parents) > 0, "Particle moved out of bounds!"
                     # this is not the root node
-                    # send update to parent
-                    self.network.queue.put(Update(self.ID, self.parents[0].master_ID, msg.iteration, msg.update_src, msg.pos))
-                    node = NBodySimulator.nodes[msg.src]
+                    parent_ID = None
                     child_box = self.lookup_child_ID(msg.src)
-                    if child_box is not None and type(node) == Particle:
+                    if child_box is not None and type(NBodySimulator.nodes[msg.src]) == Particle:
                         # msg came from a child particle -- remove it as a child
                         self.children[child_box] = []
-                        num_particle_children = sum([1 for nodes in self.children.values() if (len(nodes) > 0 and type(nodes[0]) == Particle)])
-                        if num_particle_children < 2 and self.num_children() < 2:
-                            # there is only one child remaining and it is a particle node -- this node doesn't need to be here anymore
-                            # remove this node (and replicas) from the tree and the simulation
-                            self.kill()
+                        parent_ID = self.check_kill()
+                    # send update to parent
+                    parent_ID = parent_ID if parent_ID is not None else self.parents[0].master_ID
+                    self.network.queue.put(Update(self.ID, parent_ID, msg.iteration, msg.update_src, msg.pos))
                 else:
                     # the particle is in this bounding box
                     particle_node = NBodySimulator.nodes[msg.update_src]
@@ -502,6 +506,17 @@ class InternalMasterNode(InternalReplicaNode):
 
     def num_children(self):
         return sum([1 for nodes in self.children.values() if len(nodes) > 0])
+
+    def check_kill(self):
+        self.log('Checking if this node should be killed')
+        parent_ID = None
+        num_particle_children = sum([1 for nodes in self.children.values() if (len(nodes) > 0 and type(nodes[0]) == Particle)])
+        if num_particle_children == 1 and self.num_children() == 1:
+            # there is only one child remaining and it is a particle node -- this node doesn't need to be here anymore
+            # remove this node (and replicas) from the tree and the simulation
+            parent_ID = self.kill()
+        # return the parent of the last killed node (or None if the node is not killed)
+        return parent_ID
 
     def add_particle(self, particle_node, iteration, update_src):
         """Add the given particle node as a child"""
@@ -705,7 +720,7 @@ class NBodySimulator(object):
 
         # create quadtree
         NBodySimulator.root_node = InternalMasterNode(self.env, self.network, mins, maxs, particles, parents=[])
-        NBodySimulator.log_quadtree()
+        NBodySimulator.log(NBodySimulator.quadtree_str())
 
     def sample_queues(self):
         """Sample node queue occupancy"""
@@ -717,11 +732,11 @@ class NBodySimulator(object):
             yield self.env.timeout(NBodySimulator.sample_period)
 
     @staticmethod
-    def log_quadtree():
+    def quadtree_str():
         d = OrderedDict()
         d['root::{}'.format(str(NBodySimulator.root_node))] = NBodySimulator.root_node.make_dict()
         tr = LeftAligned()
-        NBodySimulator.log('Quad Tree:\n' + tr(d))
+        return 'Quad Tree:\n' + tr(d)
 
     @staticmethod
     def check_traversal_done(now):
@@ -747,7 +762,7 @@ class NBodySimulator(object):
             NBodySimulator.iteration_start_time = now
             NBodySimulator.iteration_cnt += 1
             NBodySimulator.converged_node_cnt = 0
-            NBodySimulator.log_quadtree()
+            NBodySimulator.log(NBodySimulator.quadtree_str())
         # simulation is complete after all iterations
         if NBodySimulator.iteration_cnt == NBodySimulator.num_iterations:
             NBodySimulator.complete = True
@@ -764,9 +779,9 @@ class NBodySimulator(object):
         write_csv(df, os.path.join(NBodySimulator.out_run_dir, 'q_sizes.csv'))
 
         # log the iteration log
-        print 'len(iteration) = {}'.format(NBodySimulator.iteration_log['iteration'])
-        print 'len(traversal_time) = {}'.format(NBodySimulator.iteration_log['traversal_time'])
-        print 'len(iteration_time) = {}'.format(NBodySimulator.iteration_log['iteration_time'])
+        self.log('iteration = {}'.format(NBodySimulator.iteration_log['iteration']))
+        self.log('traversal_time = {}'.format(NBodySimulator.iteration_log['traversal_time']))
+        self.log('iteration_time = {}'.format(NBodySimulator.iteration_log['iteration_time']))
         df = pd.DataFrame(NBodySimulator.iteration_log)
         write_csv(df, os.path.join(NBodySimulator.out_run_dir, 'iteration_log.csv'))
 
