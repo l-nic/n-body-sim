@@ -7,6 +7,8 @@ import numpy as np
 import sys, os
 import random
 import json
+from collections import OrderedDict
+from asciitree import LeftAligned
 
 # default cmdline args
 cmd_parser = argparse.ArgumentParser()
@@ -73,7 +75,7 @@ class TraversalReq(Message):
         self.expected = expected
 
     def __str__(self):
-        return "(TraversalReq) " + super(TraversalReq, self).__str__()
+        return "(TraversalReq) " + super(TraversalReq, self).__str__() + ", traversal_src: {}, pos: {}, sources: {}, expected: {}".format(self.traversal_src, self.pos, self.sources, self.expected)
 
 class TraversalResp(Message):
     def __init__(self, src, dst, iteration, sources, expected):
@@ -82,20 +84,27 @@ class TraversalResp(Message):
         self.expected = expected
 
     def __str__(self):
-        return "(TraversalResp) " + super(TraversalResp, self).__str__()
+        return "(TraversalResp) " + super(TraversalResp, self).__str__() + ", sources: {}, expected: {}".format(self.sources, self.expected)
 
 class StartUpdate(Message):
     def __str__(self):
         return "(StartUpdate) " + super(StartUpdate, self).__str__()
 
 class Update(Message):
-    def __str__(self):
-        return "(Update) " + super(Update, self).__str__()
+    def __init__(self, src, dst, iteration, update_src, pos):
+        super(Update, self).__init__(src, dst, iteration)
+        self.update_src = update_src # ID of the particle that initiated the update 
+        self.pos = pos # position of particle
 
+    def __str__(self):
+        return "(Update) " + super(Update, self).__str__() + ", update_src: {}, pos: {}".format(self.update_src, self.pos)
+
+# NOTE: currently unused
 class RemovalReq(Message):
     def __str__(self):
         return "(RemovalReq) " + super(RemovalReq, self).__str__()
 
+# NOTE: currently unused
 class RemovalAck(Message):
     def __str__(self):
         return "(RemovalAck) " + super(RemovalAck, self).__str__()
@@ -118,13 +127,13 @@ class Node(object):
         self.queue = simpy.Store(self.env)
         self.ID = Node.count
         Node.count += 1
-        self.iteration_cnt = 0 # local iteration counter
 
     @staticmethod
     def init_params():
         Node.traversal_req_service_time = Node.sample_generator(NBodySimulator.config['traversal_req_service_time_dist'].next())
         Node.traversal_resp_service_time = Node.sample_generator(NBodySimulator.config['traversal_resp_service_time_dist'].next())
         Node.theta = NBodySimulator.config['theta'].next()
+        Node.velocity = NBodySimulator.config['velocity'].next()
 
     @staticmethod
     def sample_generator(filename):
@@ -137,8 +146,9 @@ class Node(object):
 class Particle(Node):
     """Particle Node class."""
     count = 0
-    def __init__(self, env, network, parents, parent_master_ID, pos):
+    def __init__(self, env, network, pos, parents):
         super(Particle, self).__init__(env, network)
+        self.iteration_cnt = 0 # local iteration counter
         self.particle_ID = Particle.count
         Particle.count += 1
         self.env.process(self.start())
@@ -149,20 +159,31 @@ class Particle(Node):
         self.pos = pos
 
         self.parents = parents
-        self.parent_master_ID = parent_master_ID
         self.master_ID = self.ID
         self.response_bitmap = {}
 
         # add to the list of simulation nodes
-        NBodySimulator.all_nodes += self.get_all_replicas()
-        NBodySimulator.particle_nodes += self.get_all_replicas()
+        for n in self.get_all_replicas():
+            NBodySimulator.nodes[n.ID] = n
+            NBodySimulator.particle_nodes[n.ID] = n
 
     def __str__(self):
         return self.name
 
+    def make_dict(self):
+        return OrderedDict()
+
     @staticmethod
     def init_params():
         pass
+
+    def set_parents(self, parents, send_update=False):
+        self.parents = parents
+
+        # need to potenitally resend update in this iteration
+        # this is needed if a particle originally sent an update to a parent node that was killed
+        if send_update:
+            self.network.queue.put(Update(self.ID, self.parents[0].master_ID, self.iteration_cnt, self.ID, self.pos))
 
     def get_all_replicas(self):
         return [self]
@@ -178,9 +199,7 @@ class Particle(Node):
             self.log('Processing message: {}'.format(str(msg)))
             if type(msg) == Start:
                 # send out initial traversal msg to a root node replica
-                dst_node = random.choice(NBodySimulator.root_node.get_all_replicas())
-                self.log('Sending traversal msg to root node {}'.format(dst_node.ID))
-                self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, self.pos, sources=[], expected=[dst_node.master_ID]))
+                self.start_traversal()
             elif type(msg) == TraversalReq:
                 # process request and send back response
                 yield self.env.timeout(Node.traversal_req_service_time.next())
@@ -200,57 +219,55 @@ class Particle(Node):
                 if len(self.response_bitmap) == sum(self.response_bitmap.values()):
                     # all required responses have been received for this particle
                     NBodySimulator.check_traversal_done(self.env.now)
-            # TODO: implement tree update phase
             elif type(msg) == StartUpdate:
                 # check to make sure all responses have been received
                 if len(self.response_bitmap) != sum(self.response_bitmap.values()):
                     self.log('ERROR: All required responses have not been received ... Iteration failed')
                     sys.exit(1)
-                # send Update msg to master parent
-                
-
-                # TODO: This is just place holder logic to move onto the next iteration immediately because the update phase is not implemented
-                self.iteration_cnt += 1
                 self.response_bitmap = {}
+                # update the particle's position randomly
+                self.pos += (np.random.random((1, 2))[0] + np.array([-0.5, -0.5]))*Node.velocity
+                # make sure the particle stays "in bounds"
+                self.pos = self.pos if (self.pos[0] >= 0 and self.pos[0] <= 1 and self.pos[1] >= 0 and self.pos[1] < 1) else np.random.random((1,2))[0]
+                # send Update msg to master parent
+                self.network.queue.put(Update(self.ID, self.parents[0].master_ID, self.iteration_cnt, self.ID, self.pos))
+            elif type(msg) == Convergence:
+                # quad tree has converged and it is safe to move onto the next iteration
+                self.iteration_cnt += 1
+                # check if the simulation has completed
                 NBodySimulator.check_done(self.env.now)
                 if not NBodySimulator.complete:
-                    # send next traversal request
-                    dst_node = random.choice(NBodySimulator.root_node.get_all_replicas())
-                    self.log('Sending traversal msg to root node {}'.format(dst_node.ID))
-                    self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, self.pos, sources=[], expected=[dst_node.master_ID]))
-#            # TODO: currently unused
-#            elif type(msg) == Convergence:
-#                # quad tree has converged and it is safe to move onto the next iteration
-#                self.iteration_cnt += 1
-#                # check if the simulation has completed
-#                NBodySimulator.check_done(self.env.now)
-#                if not NBodySimulator.complete:
-#                    # send next traversal request
-#                    dst_node = random.choice(NBodySimulator.root_node.get_all_replicas())
-#                    self.log('Sending traversal msg to root node: {}'.format(dst_node.ID))
-#                    self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt))
+                    self.start_traversal()
             else:
                self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
                sys.exit(1)
 
+    def start_traversal(self):
+        # send next traversal request
+        dst_node = random.choice(NBodySimulator.root_node.get_all_replicas())
+        self.log('Sending traversal msg to root node: {}'.format(dst_node.ID))
+        self.network.queue.put(TraversalReq(self.ID, dst_node.ID, self.iteration_cnt, self.ID, self.pos, sources=[], expected=[dst_node.master_ID]))
 
 class InternalReplicaNode(Node):
     """Internal Replica Node class."""
-    count = 0
-    def __init__(self, env, network, parents, parent_master_ID, com, sizes, master_ID=None):
+    def __init__(self, env, network, mins, maxs, parents, master_ID=None):
         super(InternalReplicaNode, self).__init__(env, network)
-        self.internal_node_ID = InternalReplicaNode.count
-        InternalReplicaNode.count += 1
         self.env.process(self.start())
         self.name = 'IR-{}'.format(self.ID)
         self.logger.set_filename('{}.log'.format(self.name))
+        self.killed = False
 
+        self.children = {'NW':[], 'NE':[], 'SW':[], 'SE':[]}
         self.parents = parents
-        self.parent_master_ID = parent_master_ID
+        self.mins = mins
+        self.maxs = maxs
+        # The midpoint of the bounding box (X,Y) position
+        self.mids = 0.5 * (self.mins + self.maxs)
         # Center of Mass (X,Y) position
-        self.com = com
+        # NOTE: the com is actually mids. Is it worth properly computing the center of mass?
+        self.com = self.mids
         # Size of bounding box (X width, Y width)
-        self.sizes = sizes
+        self.sizes = self.maxs - self.mins
 
         if master_ID is None:
             self.master_ID = self.ID
@@ -264,15 +281,12 @@ class InternalReplicaNode(Node):
     def log(self, s):
         return self.logger.log('{}: {}'.format(self.name, s))
 
-    def set_children(self, children):
-        self.children = children
-
     def process_traversal_req(self, msg):
         yield self.env.timeout(Node.traversal_req_service_time.next())
-        # If the particle is sufficiently far away then send back a response.Otherwise, the
+        # If the particle is sufficiently far away then send back a response. Otherwise, the
         # node will forward the traversal request to every child (one replica each).
-#        if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
-        if random.random() < Node.theta:
+        #if random.random() < Node.theta:
+        if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
             # this node is "sufficiently far away" and can respond
             self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
         else:
@@ -290,9 +304,13 @@ class InternalReplicaNode(Node):
                                        expected = msg.expected + master_targets)
                 self.network.queue.put(fwd_msg)
 
+    def kill(self):
+        self.killed = True
+        del NBodySimulator.nodes[self.ID]
+
     def start(self):
         """Receive and process messages"""
-        while not NBodySimulator.complete:
+        while not NBodySimulator.complete and not self.killed:
             # wait for a msg that is for the current iteration
             msg = yield self.queue.get()
             self.log('Processing message: {}'.format(str(msg)))
@@ -304,96 +322,318 @@ class InternalReplicaNode(Node):
 
 class InternalMasterNode(InternalReplicaNode):
     """Internal Master Node class."""
-    count = 0
-    def __init__(self, env, network, com, sizes, parents, parent_master_ID=None):
-        super(InternalMasterNode, self).__init__(env, network, parents, parent_master_ID, com, sizes)
-        self.internal_node_ID = InternalMasterNode.count
-        InternalMasterNode.count += 1
+    def __init__(self, env, network, mins, maxs, particles=[], parents=[]):
+        super(InternalMasterNode, self).__init__(env, network, mins, maxs, parents)
         self.name = 'IM-{}'.format(self.ID)
         self.logger.set_filename('{}.log'.format(self.name))
 
+        # this iteration attribute is only used by the master root node to ensure only
+        # one convergence msg is forwarded to all children
+        self.iteration = 0
+
+        # bits to keep track of which children have converged in each iteration
+        self.convergence_bits = {}
+        # bits to keep track of which children particle nodes we've processed updates from in each iteration
+        self.update_bits = {}
+
         # make replicas
-        self.replicas = [InternalReplicaNode(env, network, parents, parent_master_ID, self.com, self.sizes, master_ID=self.ID) for i in range(InternalMasterNode.rep_factor-1)]
+        self.replicas = [InternalReplicaNode(env, network, mins, maxs, parents, master_ID=self.ID) for i in range(InternalMasterNode.rep_factor-1)]
 
         # add self and replicas to simulation nodes
-        NBodySimulator.all_nodes += self.get_all_replicas()
-        NBodySimulator.internal_nodes += self.get_all_replicas()
+        for n in self.get_all_replicas():
+            NBodySimulator.nodes[n.ID] = n
 
-    def set_children(self, children):
-        """Directly set children rather than initializing using a quadtree"""
-        self.children = children
-        # assign children to all replicas
-        for r in self.replicas:
-            r.set_children(self.children)
+        if len(particles) > 0:
+            data = np.array([p.pos for p in particles])
 
-    def init_with_quadtree(self, quadtree):
-        """Initialize the children using a quadtree"""
-        # make sure that this is actually an internal node
-        assert len(quadtree.children) > 0
+            # split the particle positions into four quadrants
+            data_q1 = data[(data[:, 0] < self.mids[0])
+                           & (data[:, 1] < self.mids[1])]
+            data_q2 = data[(data[:, 0] < self.mids[0])
+                           & (data[:, 1] >= self.mids[1])]
+            data_q3 = data[(data[:, 0] >= self.mids[0])
+                           & (data[:, 1] < self.mids[1])]
+            data_q4 = data[(data[:, 0] >= self.mids[0])
+                           & (data[:, 1] >= self.mids[1])]
 
-        # create the children nodes
-        # self.children is a dictionary that maps position to list of replicas
-        self.children = {'NW':[], 'NE':[], 'SW':[], 'SE':[]}
-        for pos, qt_child in quadtree.children.iteritems():
-            if qt_child.num_particles() == 1:
-                # create particle node
-                node = Particle(self.env, self.network, parents=self.get_all_replicas(), parent_master_ID=self.ID, pos=qt_child.data[0])
-            else:
-                # create new internal master node (recursive call)
-                node = InternalMasterNode(self.env, self.network, qt_child.mids, qt_child.sizes, parents=self.get_all_replicas(), parent_master_ID=self.ID)
-                node.init_with_quadtree(qt_child)
-            self.children[pos] = node.get_all_replicas()
+            # recursively build a quad tree on each quadrant with multiple particles
+            q1_particles = [p for p in particles if p.pos in data_q1]
+            self.build_subtree('SW', data_q1, self.get_child_mins('SW'), self.get_child_maxs('SW'), q1_particles)
 
-        # assign children to all replicas
-        for r in self.replicas:
-            r.set_children(self.children)
+            q2_particles = [p for p in particles if p.pos in data_q2]
+            self.build_subtree('NW', data_q2, self.get_child_mins('NW'), self.get_child_maxs('NW'), q2_particles)
+
+            q3_particles = [p for p in particles if p.pos in data_q3]
+            self.build_subtree('SE', data_q3, self.get_child_mins('SE'), self.get_child_maxs('SE'), q3_particles)
+
+            q4_particles = [p for p in particles if p.pos in data_q4]
+            self.build_subtree('NE', data_q4, self.get_child_mins('NE'), self.get_child_maxs('NE'), q4_particles)
+
+            # assign children to all replicas
+            for r in self.replicas:
+                r.children = self.children
+
+    def get_child_mins(self, box):
+        xmin, ymin = self.mins
+        xmax, ymax = self.maxs
+        xmid, ymid = self.mids
+
+        if box == 'SW':
+            return np.array([xmin, ymin])
+        elif box == 'NW':
+            return np.array([xmin, ymid])
+        elif box == 'SE':
+            return np.array([xmid, ymin])
+        elif box == 'NE':
+            return np.array([xmid, ymid])
+
+    def get_child_maxs(self, box):
+        xmin, ymin = self.mins
+        xmax, ymax = self.maxs
+        xmid, ymid = self.mids
+
+        if box == 'SW':
+            return np.array([xmid, ymid])
+        elif box == 'NW':
+            return np.array([xmid, ymax])
+        elif box == 'SE':
+            return np.array([xmax, ymid])
+        elif box == 'NE':
+            return np.array([xmax, ymax])
+
+    def build_subtree(self, box, data, mins, maxs, particles):
+        # recursively build a quad tree on each quadrant with multiple particles
+        if data.shape[0] > 1:
+            # there are multiple particles in this box
+            new_node = InternalMasterNode(self.env, self.network, mins, maxs, particles,
+                                          parents=self.get_all_replicas())
+            self.children[box] = new_node.get_all_replicas()
+        elif data.shape[0] == 1:
+            # there is only one particle in this box
+            assert len(particles) == 1, "Incorrect number of particles in box ..."
+            self.children[box] = particles[0].get_all_replicas()
+            particles[0].set_parents(self.get_all_replicas())
+            # remember to process update from this particle
+            self.update_bits[particles[0].master_ID] = 0
+        else:
+            self.children[box] = []
 
     def get_all_replicas(self):
         return [self] + self.replicas
 
-    def str_child(self, pos):
-        if len(self.children[pos]) > 0:
-            return str([n for n in self.children[pos] if type(n) == InternalMasterNode or type(n) == Particle][0])
-        else:
-            return ''
+    def make_dict(self):
+        d = OrderedDict()
+        for box, children in self.children.iteritems():
+            if len(children) > 0:
+                c = [c for c in children if type(c) == InternalMasterNode or type(c) == Particle][0]
+                d['{}::{}'.format(box, str(c))] = c.make_dict()
+        return d
 
     def __str__(self):
-        node_str = str([n.name for n in self.get_all_replicas()])
-        nw_str = self.str_child('NW')
-        ne_str = self.str_child('NE')
-        sw_str = self.str_child('SW')
-        se_str = self.str_child('SE')
-        return """{}
-NW: ({})
-NE: ({})
-SW: ({})
-SE: ({})
-""".format(node_str, nw_str, ne_str, sw_str, se_str)
+        return self.name
 
     @staticmethod
     def init_params():
         InternalMasterNode.rep_factor = NBodySimulator.config['replication_factor'].next()
 
+    def lookup_child_ID(self, ID):
+        """Return the box ID (i.e. NW, NE, SE, SW) for the given node ID, or None"""
+        for box_ID, children in self.children.iteritems():
+            if ID in [c.ID for c in children]:
+                return box_ID
+        return None
+
+    def kill(self):
+        # cannot kill the root node
+        assert len(self.parents) > 0, "Cannot kill the root node" 
+        self.log('Killed')
+
+        self.killed = True
+        del NBodySimulator.nodes[self.ID]
+
+        for node in self.replicas:
+            node.kill()
+
+        parent_master = NBodySimulator.nodes[self.parents[0].master_ID]
+        parent_box_ID = parent_master.lookup_child_ID(self.ID)
+
+        # move any particle children up as the parents new children
+        for box, c_replicas in self.children.iteritems():
+            if len(c_replicas) > 0 and type(c_replicas[0]) == Particle:
+                # assign parents new children
+                for p in self.parents:
+                    p.children[parent_box_ID] = c_replicas
+                # assign children's new parents
+                for c in c_replicas:
+                    c.set_parents(self.parents, send_update=True)
+                # tell parent that it needs to process an update from this new particle before it can converge
+                parent_master.update_bits[c_replicas[0].master_ID] = 0
+
     def start(self):
         """Receive and process messages"""
-        while not NBodySimulator.complete:
+        while not NBodySimulator.complete and not self.killed:
             # wait for a msg that is for the current iteration
             msg = yield self.queue.get()
             self.log('Processing message: {}'.format(str(msg)))
             if type(msg) == TraversalReq:
                 yield self.env.process(self.process_traversal_req(msg))
-#            # TODO: implement the tree update phase
-#            elif type(msg) == Update:
-#                pass
-#            elif type(msg) == RemovalReq:
-#                pass
-#            elif type(msg) == RemovalResp:
-#                pass
-#            elif type(msg) == Convergence:
-#                pass
+            elif type(msg) == Update:
+                # check if this is one of the particles we need to process before converging
+                if msg.update_src in self.update_bits:
+                    self.update_bits[msg.update_src] = 1
+                # check if the particle is in this bounding box
+                result = self.classify_pos(msg.pos)
+                self.log('Classified particle {} into box {}'.format(msg.pos, result))
+                if result is None:
+                    # the particle is not in this bounding box
+                    assert len(self.parents) > 0, "Particle moved out of bounds!"
+                    # this is not the root node
+                    # send update to parent
+                    self.network.queue.put(Update(self.ID, self.parents[0].master_ID, msg.iteration, msg.update_src, msg.pos))
+                    node = NBodySimulator.nodes[msg.src]
+                    child_box = self.lookup_child_ID(msg.src)
+                    if child_box is not None and type(node) == Particle:
+                        # msg came from a child particle -- remove it as a child
+                        self.children[child_box] = []
+                        num_particle_children = sum([1 for nodes in self.children.values() if (len(nodes) > 0 and type(nodes[0]) == Particle)])
+                        if num_particle_children < 2 and self.num_children() < 2:
+                            # there is only one child remaining and it is a particle node -- this node doesn't need to be here anymore
+                            # remove this node (and replicas) from the tree and the simulation
+                            self.kill()
+                else:
+                    # the particle is in this bounding box
+                    particle_node = NBodySimulator.nodes[msg.update_src]
+                    self.add_particle(particle_node, msg.iteration)
+            elif type(msg) == Convergence:
+                # Can receive convergence msg from child or parent
+                # If from parent then forward to all children and reset convergence tracking state
+                # If from child then check to see if we've received convergence msgs from all internal nodes and update msgs from all particle nodes
+                #   If all msgs have been received then send convergence msg upstream (or downstream if root node)
+                if msg.src in [n.ID for n in self.parents]:
+                    # convergence msg from parent -- forward to all children
+                    self.log('Received Convergence msg from parent -- forwarding to all children')
+                    self.fwd_convergence_children(msg.iteration)
+                else:
+                    # convergence msg from child -- set convergence bit
+                    self.log('Received Convergence msg from child')
+                    child_box = self.lookup_child_ID(msg.src)
+                    self.convergence_bits[child_box] = 1
+                    self.check_convergence(msg.iteration)
             else:
-               self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
-               sys.exit(1)
+                self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
+                sys.exit(1)
+
+    def num_children(self):
+        return sum([1 for nodes in self.children.values() if len(nodes) > 0])
+
+    def add_particle(self, particle_node, iteration):
+        """Add the given particle node as a child"""
+        child_box = self.classify_pos(particle_node.pos)
+        assert child_box is not None, "Attempted to add a particle child that is not in this box"
+
+        self.log('Attempting to add particle {} to box {}'.format(particle_node.pos, child_box))
+
+        # if the particle is already a child, remove it before preceeding
+        orig_child_box = self.lookup_child_ID(particle_node.ID)
+        if orig_child_box is not None:
+            self.children[orig_child_box] = []
+
+        if len(self.children[child_box]) == 0 or (type(self.children[child_box][0]) == Particle and self.update_bits[self.children[child_box][0].master_ID] == 0):
+            # currently no children is this box OR there is a particle child, but its update hasn't been processed yet
+            self.log('Added particle {} to box {}'.format(particle_node.pos, child_box))
+            self.children[child_box] = particle_node.get_all_replicas()
+            particle_node.set_parents(self.get_all_replicas())
+            # set this child's convergence bit and check if this node has converged
+            self.convergence_bits[child_box] = 1
+            self.check_convergence(iteration)
+        elif type(self.children[child_box][0]) in [InternalMasterNode, InternalReplicaNode]:
+            # send update to the child internal node
+            self.log('Sending update to child internal node')
+            child_master_ID = self.children[child_box][0].master_ID
+            self.network.queue.put(Update(self.ID, child_master_ID, iteration, particle_node.ID, particle_node.pos))
+            # unset this child's convergence bit until re-receiving a convergence message from it
+            self.convergence_bits[child_box] = 0
+        elif type(self.children[child_box][0]) == Particle and self.update_bits[self.children[child_box][0].master_ID] == 1:
+            # particle was classified into the same box as another particle
+            self.log('Creating new internal node')
+            # create new internal node
+            new_node = InternalMasterNode(self.env, self.network, self.get_child_mins(child_box), self.get_child_maxs(child_box), parents=self.get_all_replicas())
+            orig_particle_node = NBodySimulator.nodes[self.children[child_box][0].master_ID]
+            # recursively add particles to the new node
+            new_node.add_particle(orig_particle_node, iteration)
+            new_node.add_particle(particle_node, iteration)
+            self.children[child_box] = new_node.get_all_replicas()
+            # unset this child's convergence bit until re-receiving a convergence message from it
+            self.convergence_bits[child_box] = 0
+
+    def check_convergence(self, iteration):
+        """Check if all required convergence / update msgs have arrived.
+           If so then send out Convergence msgs.
+        """
+        self.log('Checking convergence: {}/{} children converged'.format(sum(self.convergence_bits.values()), self.num_children()))
+        self.log('children = {}, convergence_bits = {}'.format({b:str(map(str, c)) for b,c in self.children.iteritems()}, self.convergence_bits))
+        self.log('Checking updates: {}/{} particles processed'.format(sum(self.update_bits.values()), len(self.update_bits)))
+        if self.num_children() == sum(self.convergence_bits.values()) and len(self.update_bits) == sum(self.update_bits.values()):
+            # all required convergence/update msgs have been received
+            # send convergence msgs either up or down
+            if len(self.parents) == 0:
+                # this is the root node so send convergence msgs to all children
+                if self.iteration == iteration:
+                    # make sure to only do this once per iteration
+                    self.fwd_convergence_children(iteration)
+                    self.iteration += 1
+            else:
+               # this is a non-root node
+               # send convergence msg to parent
+               self.log('')
+               self.network.queue.put(Convergence(self.ID, self.parents[0].master_ID, iteration))
+
+    def fwd_convergence_children(self, iteration):
+        self.log('Forwarding convergence msgs to children')
+        # reset update_bits
+        self.update_bits = {}
+        # send convergence msgs to children
+        for children in self.children.values():
+            if len(children) > 0:
+                self.network.queue.put(Convergence(self.ID, children[0].master_ID, iteration))
+                # reset update bits
+                if type(children[0]) == Particle:
+                    self.update_bits[children[0].master_ID] = 0
+        # reset convergence bits
+        self.convergence_bits = {}
+
+    def classify_pos(self, pos):
+        """Classify the position into the appropriate chlid bounding box or return none if it is not in this bounding box """
+
+        # first check if the position is in the bounding box
+        data = pos[(pos[0] >= self.mids[0] - self.sizes[0]/2.0)
+                    & (pos[0] <= self.mids[0] + self.sizes[0]/2.0)
+                    & (pos[1] >= self.mids[1] - self.sizes[1]/2.0)
+                    & (pos[1] <= self.mids[1] + self.sizes[1]/2.0)]
+
+        if data.shape[0] == 0:
+            return None
+
+        # split the data into four quadrants
+        data_q1 = pos[(pos[0] < self.mids[0])
+                       & (pos[1] < self.mids[1])]
+        data_q2 = pos[(pos[0] < self.mids[0])
+                       & (pos[1] >= self.mids[1])]
+        data_q3 = pos[(pos[0] >= self.mids[0])
+                       & (pos[1] < self.mids[1])]
+        data_q4 = pos[(pos[0] >= self.mids[0])
+                       & (pos[1] >= self.mids[1])]
+
+        if data_q1.shape[0] > 0:
+            return 'SW'
+        if data_q2.shape[0] > 0:
+            return 'NW'
+        if data_q3.shape[0] > 0:
+            return 'SE'
+        if data_q4.shape[0] > 0:
+            return 'NE'
+        self.log('ERROR: unable to classify position: {}'.format(pos))
+        sys.exit(1)
 
 #############
 ## Network ##
@@ -406,21 +646,17 @@ class Network(object):
         self.logger = Logger(env)
         self.logger.set_filename('network.log')
         self.queue = simpy.Store(env)
-        self.nodes = {}
         self.env.process(self.start())
 
     @staticmethod
     def init_params():
         Network.delay = NBodySimulator.config['network_delay'].next()
 
-    def add_nodes(self, nodes):
-        self.nodes = {n.ID: n for n in nodes}
-
     def start(self):
         """Start forwarding messages"""
         while not NBodySimulator.complete:
             msg = yield self.queue.get()
-            self.logger.log('Switching msg\n\t"{}"'.format(str(msg)))
+            self.logger.log('Switching msg: "{}"'.format(str(msg)))
             # need to kick this off asynchronously so this is a non-blocking network
             self.env.process(self.transmit_msg(msg))
 
@@ -428,7 +664,8 @@ class Network(object):
         # model the network communication delay
         yield self.env.timeout(Network.delay)
         # put the message in the node's queue
-        self.nodes[msg.dst].queue.put(msg)
+        # TODO: I think this could potentially fail if a particle node sends an update to a parent that is killed
+        NBodySimulator.nodes[msg.dst].queue.put(msg)
 
 
 def DistGenerator(dist, **kwargs):
@@ -454,81 +691,6 @@ def DistGenerator(dist, **kwargs):
             print 'ERROR: Unsupported distrbution: {}'.format(dist)
             sys.exit(1)
 
-###############
-## Quad Tree ##
-###############
-class QuadTree:
-    """Simple Quad-tree class.
-       Adapted from: https://www.astroml.org/book_figures/chapter2/fig_quadtree_example.html
-    """
-
-    # class initialization function
-    def __init__(self, data, mins, maxs, parent=None):
-        self.parent = parent
-        self.data = np.asarray(data)
-
-        # data should be two-dimensional
-        assert self.data.shape[1] == 2
-
-        if mins is None:
-            mins = data.min(0)
-        if maxs is None:
-            maxs = data.max(0)
-
-        self.mins = np.asarray(mins)
-        self.maxs = np.asarray(maxs)
-        self.sizes = self.maxs - self.mins
-
-        self.children = {}
-
-        self.mids = 0.5 * (self.mins + self.maxs)
-        xmin, ymin = self.mins
-        xmax, ymax = self.maxs
-        xmid, ymid = self.mids
-
-        # keep dividing if there is more than one particle in the box
-        if self.num_particles() > 1:
-            # split the data into four quadrants
-            data_q1 = data[(data[:, 0] < self.mids[0])
-                           & (data[:, 1] < self.mids[1])]
-            data_q2 = data[(data[:, 0] < self.mids[0])
-                           & (data[:, 1] >= self.mids[1])]
-            data_q3 = data[(data[:, 0] >= self.mids[0])
-                           & (data[:, 1] < self.mids[1])]
-            data_q4 = data[(data[:, 0] >= self.mids[0])
-                           & (data[:, 1] >= self.mids[1])]
-
-            # recursively build a quad tree on each quadrant which has data
-            if data_q1.shape[0] > 0:
-                self.children['SW'] = QuadTree(data_q1,
-                                               [xmin, ymin], [xmid, ymid],
-                                               self)
-            if data_q2.shape[0] > 0:
-                self.children['NW'] = QuadTree(data_q2,
-                                               [xmin, ymid], [xmid, ymax],
-                                               self)
-            if data_q3.shape[0] > 0:
-                self.children['SE'] = QuadTree(data_q3,
-                                               [xmid, ymin], [xmax, ymid],
-                                               self)
-            if data_q4.shape[0] > 0:
-                self.children['NE'] = QuadTree(data_q4,
-                                               [xmid, ymid], [xmax, ymax],
-                                               self)
-
-    def num_particles(self):
-        return self.data.shape[0]
-
-    def draw_rectangle(self, ax):
-        """Recursively plot every box with exactly one particle"""
-        if self.num_particles() == 1:
-            rect = plt.Rectangle(self.mins, *self.sizes, zorder=2,
-                                 ec='#000000', fc='none')
-            ax.add_patch(rect)
-        if self.num_particles() > 1:
-            for pos, child in self.children.iteritems():
-                child.draw_rectangle(ax)
-
 ######################
 ## N-Body Simulator ##
 ######################
@@ -539,75 +701,84 @@ class NBodySimulator(object):
     out_dir = 'out'
     out_run_dir = 'out/run-0'
     # global logs (across runs)
-    avg_throughput = {'all':[]} # iterations/time
+    run_ID = 0
+    run_log = {'run':[],
+               'avg_throughput': []} # iterations/time
     def __init__(self, env):
         self.env = env
         NBodySimulator.num_iterations = NBodySimulator.config['num_iterations'].next()
         NBodySimulator.num_particles = NBodySimulator.config['num_particles'].next()
         NBodySimulator.sample_period = NBodySimulator.config['sample_period'].next()
-        self.logger = Logger(env)
-        self.logger.set_filename('n-body-sim.log')
+        NBodySimulator.logger = Logger(env)
+        NBodySimulator.logger.set_filename('n-body-sim.log')
         self.network = Network(self.env)
 
         Message.count = 0
         Node.count = 0
         Particle.count = 0
-        InternalReplicaNode.count = 0
-        InternalMasterNode.count = 0
 
+        # initialize run local variables
+        self.q_sizes = {}
+        self.q_sizes['time'] = []
+        self.q_sizes['node'] = []
+        self.q_sizes['qsize'] = []
+        NBodySimulator.iteration_log = {}
+        NBodySimulator.iteration_log['iteration'] = []
+        NBodySimulator.iteration_log['traversal_time'] = []
+        NBodySimulator.iteration_log['iteration_time'] = []
+        NBodySimulator.complete = False
+        NBodySimulator.traversed_node_cnt = 0
+        NBodySimulator.converged_node_cnt = 0
+        NBodySimulator.iteration_cnt = 0
+        NBodySimulator.traversal_start_time = 0
+        NBodySimulator.iteration_start_time = 0
+        NBodySimulator.finish_time = 0
+
+        # dictionaries to keep track of the currently active nodes & particles
+        NBodySimulator.nodes = {}
+        NBodySimulator.particle_nodes = {}
         # create quad tree
-        NBodySimulator.all_nodes = []
-        NBodySimulator.particle_nodes = []
-        NBodySimulator.internal_nodes = []
         self.make_quadtree()
 
-        # connect nodes to network
-        self.network.add_nodes(NBodySimulator.all_nodes)
-        
-        self.init_sim()
+        # send out Start messages to particle nodes
+        for n in NBodySimulator.particle_nodes.values():
+            n.queue.put(Start(0, n.ID, 0))
+        # start logging
+        if self.sample_period > 0:
+            self.env.process(self.sample_queues())
+
+    @staticmethod
+    def log(s):
+        NBodySimulator.logger.log('NBodySimulator: run {}: iteration {}: {}'.format(NBodySimulator.run_ID, NBodySimulator.iteration_cnt, s))
 
     def make_quadtree(self):
         """
         Create a random quad tree with the appropriate number of particles.
         """
         X = np.random.random((NBodySimulator.num_particles, 2))
-        mins = (-0.1, -0.1)
-        maxs = (1.1, 1.1)
-        quadtree = QuadTree(X, mins, maxs)
-        NBodySimulator.root_node = InternalMasterNode(self.env, self.network, quadtree.mids, quadtree.sizes, parents=[])
-        NBodySimulator.root_node.init_with_quadtree(quadtree)
-        self.logger.log("Quad Tree:")
-        self.logger.log(str(NBodySimulator.root_node))
-
-    def init_sim(self):
-        # initialize run local variables
-        self.q_sizes = {n.name:[] for n in NBodySimulator.all_nodes}
-        self.q_sizes['time'] = []
-        self.q_sizes['network'] = []
-        NBodySimulator.complete = False
-        NBodySimulator.traversed_node_cnt = 0
-        NBodySimulator.converged_node_cnt = 0
-        NBodySimulator.iteration_cnt = 0
-        NBodySimulator.traversal_times = {'all': []}
-        NBodySimulator.iteration_times = {'all': []}
-        NBodySimulator.traversal_start_time = 0
-        NBodySimulator.iteration_start_time = 0
-        NBodySimulator.finish_time = 0
-        # send out Start messages to particle nodes
-        for n in NBodySimulator.particle_nodes:
-            n.queue.put(Start(0, n.ID, 0))
-        # start logging
-        if self.sample_period > 0:
-            self.env.process(self.sample_queues())
+        mins = np.array([-0.1, -0.1])
+        maxs = np.array([1.1, 1.1])
+        # create all particles
+        particles = [Particle(self.env, self.network, pos, []) for pos in X]
+        # create quadtree
+        NBodySimulator.root_node = InternalMasterNode(self.env, self.network, mins, maxs, particles, parents=[])
+        NBodySimulator.log_quadtree()
 
     def sample_queues(self):
         """Sample node queue occupancy"""
         while not NBodySimulator.complete:
-            self.q_sizes['time'].append(self.env.now)
-            self.q_sizes['network'].append(len(self.network.queue.items))
-            for n in NBodySimulator.all_nodes:
-                self.q_sizes[n.name].append(len(n.queue.items))
+            for n in NBodySimulator.nodes.values():
+                self.q_sizes['time'].append(self.env.now)
+                self.q_sizes['node'].append(n.name)
+                self.q_sizes['qsize'].append(len(n.queue.items))
             yield self.env.timeout(NBodySimulator.sample_period)
+
+    @staticmethod
+    def log_quadtree():
+        d = OrderedDict()
+        d['root::{}'.format(str(NBodySimulator.root_node))] = NBodySimulator.root_node.make_dict()
+        tr = LeftAligned()
+        NBodySimulator.log('Quad Tree:\n' + tr(d))
 
     @staticmethod
     def check_traversal_done(now):
@@ -617,12 +788,13 @@ class NBodySimulator(object):
         NBodySimulator.traversed_node_cnt += 1
         if NBodySimulator.traversed_node_cnt == len(NBodySimulator.particle_nodes):
             # all particles have completed traversal
-            NBodySimulator.traversal_times['all'].append(now - NBodySimulator.traversal_start_time)
+            NBodySimulator.iteration_log['iteration'].append(NBodySimulator.iteration_cnt)
+            NBodySimulator.iteration_log['traversal_time'].append(now - NBodySimulator.traversal_start_time)
             NBodySimulator.traversal_start_time = now
             NBodySimulator.traversed_node_cnt = 0
             # TODO: this is temporary. The StartUpdate msgs will be triggered using a timer
             # send out StartUpdate messages to all particle nodes
-            for n in NBodySimulator.particle_nodes:
+            for n in NBodySimulator.particle_nodes.values():
                 n.queue.put(StartUpdate(0, n.ID, NBodySimulator.iteration_cnt))
 
     @staticmethod
@@ -631,10 +803,11 @@ class NBodySimulator(object):
         NBodySimulator.converged_node_cnt += 1
         # increment the iteration_cnt if all particle nodes have converged
         if NBodySimulator.converged_node_cnt == len(NBodySimulator.particle_nodes):
-            NBodySimulator.iteration_times['all'].append(now - NBodySimulator.iteration_start_time)
+            NBodySimulator.iteration_log['iteration_time'].append(now - NBodySimulator.iteration_start_time)
             NBodySimulator.iteration_start_time = now
             NBodySimulator.iteration_cnt += 1
             NBodySimulator.converged_node_cnt = 0
+            NBodySimulator.log_quadtree()
         # simulation is complete after all iterations
         if NBodySimulator.iteration_cnt == NBodySimulator.num_iterations:
             NBodySimulator.complete = True
@@ -650,23 +823,23 @@ class NBodySimulator(object):
         df = pd.DataFrame(self.q_sizes)
         write_csv(df, os.path.join(NBodySimulator.out_run_dir, 'q_sizes.csv'))
 
-        # log the traversal times
-        df = pd.DataFrame(NBodySimulator.traversal_times)
-        write_csv(df, os.path.join(NBodySimulator.out_run_dir, 'traversal_times.csv'))
-
-        # log the iteration times
-        df = pd.DataFrame(NBodySimulator.iteration_times)
-        write_csv(df, os.path.join(NBodySimulator.out_run_dir, 'iteration_times.csv'))
+        # log the iteration log
+        print 'len(iteration) = {}'.format(NBodySimulator.iteration_log['iteration'])
+        print 'len(traversal_time) = {}'.format(NBodySimulator.iteration_log['traversal_time'])
+        print 'len(iteration_time) = {}'.format(NBodySimulator.iteration_log['iteration_time'])
+        df = pd.DataFrame(NBodySimulator.iteration_log)
+        write_csv(df, os.path.join(NBodySimulator.out_run_dir, 'iteration_log.csv'))
 
         # record avg throughput for this run in terms of iterations/microsecond
         throughput = 1e3*float(NBodySimulator.num_iterations)/(NBodySimulator.finish_time)
-        NBodySimulator.avg_throughput['all'].append(throughput)
+        NBodySimulator.run_log['run'].append(NBodySimulator.run_ID)
+        NBodySimulator.run_log['avg_throughput'].append(throughput)
 
     @staticmethod
     def dump_global_logs():
         # log avg throughput
-        df = pd.DataFrame(NBodySimulator.avg_throughput)
-        write_csv(df, os.path.join(NBodySimulator.out_dir, 'avg_throughput.csv'))
+        df = pd.DataFrame(NBodySimulator.run_log)
+        write_csv(df, os.path.join(NBodySimulator.out_dir, 'run_log.csv'))
 
 def write_csv(df, filename):
     with open(filename, 'w') as f:
@@ -704,10 +877,10 @@ def run_nbody_sim(cmdline_args):
     # copy config file into output directory
     os.system('cp {} {}'.format(cmdline_args.config, out_dir))
     # run the simulations
-    run_cnt = 0
+    NBodySimulator.run_ID = 0
     try:
         while True:
-            print 'Running simulation {} ...'.format(run_cnt)
+            print 'Running simulation {} ...'.format(NBodySimulator.run_ID)
             # initialize random seed
             random.seed(1)
             np.random.seed(1)
@@ -719,14 +892,14 @@ def run_nbody_sim(cmdline_args):
             InternalReplicaNode.init_params()
             InternalMasterNode.init_params()
             Network.init_params()
-            NBodySimulator.out_run_dir = os.path.join(NBodySimulator.out_dir, 'run-{}'.format(run_cnt))
+            NBodySimulator.out_run_dir = os.path.join(NBodySimulator.out_dir, 'run-{}'.format(NBodySimulator.run_ID))
             if not os.path.exists(NBodySimulator.out_run_dir):
                 os.makedirs(NBodySimulator.out_run_dir)
-            run_cnt += 1
             env = simpy.Environment()
             s = NBodySimulator(env)
             env.run()
             s.dump_run_logs()
+            NBodySimulator.run_ID += 1
     except StopIteration:
         NBodySimulator.dump_global_logs()
         print 'All Simulations Complete!'
