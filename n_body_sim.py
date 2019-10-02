@@ -297,6 +297,7 @@ class InternalReplicaNode(Node):
         #if random.random() < Node.theta:
         if np.average(self.sizes)/np.linalg.norm(msg.pos - self.com) < Node.theta:
             # this node is "sufficiently far away" and can respond
+            self.log('Sending traversal response to particle P-{}'.format(msg.traversal_src))
             self.network.queue.put(TraversalResp(self.ID, msg.traversal_src, msg.iteration, sources=[self.master_ID]+msg.sources, expected=msg.expected))
         else:
             # need to forward traversal request to one replica of each child
@@ -306,6 +307,7 @@ class InternalReplicaNode(Node):
                 if len(replicas) > 0:
                     targets.append(random.choice(replicas))
             master_targets = [t.master_ID for t in targets]
+            self.log('Sending traversal requests to nodes: {}'.format(str([n.name for n in targets])))
             # forward request to each target
             for t in targets:
                 fwd_msg = TraversalReq(self.ID, t.ID, msg.iteration, msg.traversal_src, msg.pos,
@@ -428,7 +430,7 @@ class InternalMasterNode(InternalReplicaNode):
         return d
 
     def __str__(self):
-        return self.name
+        return str([n.name for n in self.get_all_replicas()])
 
     @staticmethod
     def init_params():
@@ -491,7 +493,7 @@ class InternalMasterNode(InternalReplicaNode):
                     child_box = self.lookup_child_ID(msg.src)
                     if child_box is not None and type(NBodySimulator.nodes[msg.src]) == Particle:
                         # msg came from a child particle -- remove it as a child
-                        self.children[child_box] = []
+                        self.set_child(child_box, [])
                         parent_ID = self.check_kill()
                     # send update to parent
                     parent_ID = parent_ID if parent_ID is not None else self.parents[0].master_ID
@@ -503,6 +505,10 @@ class InternalMasterNode(InternalReplicaNode):
             else:
                 self.log('ERROR: Received unexpected message: {}'.format(str(msg)))
                 sys.exit(1)
+
+    def set_child(self, box, children):
+        for n in self.get_all_replicas():
+            n.children[box] = children
 
     def num_children(self):
         return sum([1 for nodes in self.children.values() if len(nodes) > 0])
@@ -528,12 +534,12 @@ class InternalMasterNode(InternalReplicaNode):
         # if the particle is already a child, remove it before preceeding
         orig_child_box = self.lookup_child_ID(particle_node.ID)
         if orig_child_box is not None:
-            self.children[orig_child_box] = []
+            self.set_child(orig_child_box, [])
 
         if len(self.children[child_box]) == 0:
             # currently no children is this box so add it here and send convergence msg
             self.log('Added particle {} to box {}'.format(particle_node.pos, child_box))
-            self.children[child_box] = particle_node.get_all_replicas()
+            self.set_child(child_box, particle_node.get_all_replicas())
             particle_node.set_parents(self.get_all_replicas())
             # send convergence msg to the particle so the next particle can perform its update
             if particle_node.ID == update_src:
@@ -553,7 +559,7 @@ class InternalMasterNode(InternalReplicaNode):
             # recursively add both particles to the new node
             new_node.add_particle(orig_particle_node, iteration, update_src)
             new_node.add_particle(particle_node, iteration, update_src)
-            self.children[child_box] = new_node.get_all_replicas()
+            self.set_child(child_box, new_node.get_all_replicas())
 
     def classify_pos(self, pos):
         """Classify the position into the appropriate chlid bounding box or return none if it is not in this bounding box """
