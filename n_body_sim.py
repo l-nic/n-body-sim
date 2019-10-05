@@ -742,7 +742,7 @@ class NBodySimulator(object):
         d = OrderedDict()
         d['root::{}'.format(str(NBodySimulator.root_node))] = NBodySimulator.root_node.make_dict()
         tr = LeftAligned()
-        return 'Quad Tree:\n' + tr(d)
+        return 'Quad Tree ({} total nodes):\n'.format(len(NBodySimulator.nodes)) + tr(d)
 
     @staticmethod
     def check_traversal_done(now):
